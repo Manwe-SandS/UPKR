@@ -1,0 +1,204 @@
+; UPKR unpacker for BK-0010 (fast but large version)
+; (c) Manwe/SandS October 2026
+; https://manwe.pdp-11.ru
+;
+; The speed comes from tables that are built at start:
+;   - the probability is multiplied by the high byte of the state through a
+;     table of squares: a*b = ((a+b)^2 - (a-b)^2) / 4;
+;   - the new probability after each bit is taken from two tables;
+;   - the bit refill loop is duplicated in both branches, without a call.
+; The tables (3322 bytes) are placed at the very end of the screen RAM (71406-77777),
+; the result is written downwards from address 71405. The result may overwrite the
+; already used end of the packed data (it must not catch up with the unused part).
+
+	make_bin	"unpack_fast.bin"
+
+	Probs = 		71406		; 385 words: context probabilities
+	EndAddr = 	Probs		; unpacked data ends before EndAddr
+	Q = 			Probs+2376	; Q+2*k = k*k/4, read for k = -254..510 (see Bit)
+	UpA = 		Q+1776		; next probability after one, index 2*probability
+	Offset = 		UpA			; the last offset (UpA[0] is not used, Q[511] is not read)
+	UpN = 		UpA+776		; next probability after zero, index 2*probability
+	QSum = 		Q+1000		; (UpN[0] overlaps UpA[255], it is not used either)
+	QDiff = 		Q-1000
+	NewOffCtx = 	1000			; "new offset" bit
+	OffCtx = 		1002			; offset bits
+	LenCtx = 		1202			; length bits
+
+
+; build tables
+Start:	MOV	#Q,R3		; Q[k] = Q[-k] = k*k/4, the step is k/2; the fill goes down to
+						; Q[-511], that part of the table is overwritten by Probs later
+		MOV	R3,R4
+		CLR	(R3)+
+		CLR	(R3)+
+		CLR	-(R4)
+		CLR	R2
+		MOV	#1,R1
+		MOV	#255.,R0
+1:			ADD	R1,R2
+			MOV	R2,(R3)+
+			MOV	R2,-(R4)
+			ADD	R1,R2
+			MOV	R2,(R3)+
+			MOV	R2,-(R4)
+			INC	R1
+		SOB	R0,1
+
+		MOV	#UpN+1000,R2	; UpN[q] = q-(q+8)/16, UpA[256-q] = 256-UpN[q]
+		MOV	#UpA+2,R3
+		MOV	#255.,R1
+2:			MOV	R1,R0
+			ADD	#8.,R0
+			ASR	R0
+			ASR	R0
+			ASR	R0
+			ASR	R0
+			NEG	R0
+			ADD	R1,R0
+			MOV	R0,-(R2)
+			NEG	R0
+			ADD	#400,R0
+			MOV	R0,(R3)+
+		SOB	R1,2
+
+		MOV	#200,R2
+		MOV	#Probs,R1
+;		MOV	R1,Write		; uncomment to make the unpacker reusable
+		MOV	#385.,R0
+3:		MOV	R2,(R1)+		; all probabilities = 128
+		SOB	R0,3
+		MOV	#PackedEnd,R1
+		CALL	FillClr		; R0 = 0
+
+; after a literal (and at the start)
+Next:	CLR	R3			; context of the "literal" bit
+		CALL	Bit
+		BCS	Literal
+
+Match:	MOV	#NewOffCtx,R3
+		CALL	Bit
+		BCS	Length		; keep the previous offset
+NewOff:	MOV	#OffCtx,R3
+		CALL	Number
+		DEC	R5
+		BEQ	Done			; offset 0 means the end of data
+		MOV	R5,Offset
+Length:	MOV	#LenCtx,R3
+		CALL	Number
+		MOV	Write,R3
+		MOV	R3,R4
+		ADD	Offset,R4
+1:		MOVB	-(R4),-(R3)
+		SOB	R5,1
+		MOV	R3,Write
+
+; after a match a new offset always follows
+		CLR	R3
+		CALL	Bit
+		BCC	NewOff
+
+; a literal comes right after it: C = 1, R3 = 0
+Literal:	ADC	R3			; the bit goes into the byte tree
+		ASL	R3
+		.repeat	7
+		{
+			CALL	Bit
+			ADC	R3
+			ASL	R3
+		}
+		CALL	Bit
+		ADC	R3
+		DEC	Write
+		MOVB	R3,@Write
+		BR	Next
+
+; copy the unpacked file to its load address and start it
+Done:	MOV	Write,R1		; .bin header at the start of the file
+		MOV	(R1)+,R2		; get address
+		MOV	(R1)+,R0		; get length, R1 - start of data
+		MOV	R2,R3
+		MOV	#77002,-(R3)	; SOB R0,1
+		MOV	#112122,-(R3)	; MOVB (R1)+,(R2)+
+		JMP	(R3)
+
+
+; read one bit
+; input:	R3 - context offset
+; output:	C - bit
+Bit:		MOV	Probs(R3),R4
+		ASL	R4				; R4 - doubled probability of one
+		MOV	R0,R5
+		SWAB	R5
+		MOVB	R5,R5
+		ASL	R5				; R5 - doubled high byte of the state minus 512
+		CMPB	R0,Probs(R3)
+		BHIS	1
+		MOV	UpA(R4),Probs(R3)	; bit 1
+		BIC	#177400,R0
+		ADD	R5,R4
+		ADD	QSum(R4),R0
+		SUB	R5,R4
+		SUB	R5,R4
+		SUB	QDiff(R4),R0
+		BPL	FillSet
+		SEC
+		RET
+1:		SUB	Probs(R3),R0		; bit 0
+		MOV	UpN(R4),Probs(R3)
+		ADD	R5,R4
+		SUB	QSum(R4),R0
+		SUB	R5,R4
+		SUB	R5,R4
+		ADD	QDiff(R4),R0
+		BPL	FillClr
+		CLC
+		RET
+
+; refill the state after bit 1
+FillSet:	ASLB	R2
+		BNE	1
+		MOVB	-(R1),R2
+		ROLB	R2
+1:		ROL	R0
+		BPL	FillSet
+		SEC
+		RET
+
+; refill the state after bit 0
+FillClr:	ASLB	R2
+		BNE	1
+		MOVB	-(R1),R2
+		ROLB	R2
+1:		ROL	R0
+		BPL	FillClr
+		CLC
+		RET
+
+; read a number (interleaved Elias gamma code)
+; input:	R3 - context offset
+; output:	R5 - number
+Number:	MOV	#100000,-(SP)	; accumulator with a marker
+1:			CALL	Bit
+			BCS	2
+			TST	(R3)+
+			CALL	Bit
+			ROR	(SP)
+			TST	(R3)+
+		BR	1
+2:		ROR	(SP)			; the stop bit becomes the top bit
+3:		ROR	(SP)			; shift the number down to the low bits
+		BCC	3
+		POP	R5
+		RET
+
+
+; --- data ---
+Write:	.WORD EndAddr
+; the size of packed.upk must be even (upkr-bk pads the file with a leading zero
+; byte if needed)
+Packed:	insert_file	"packed.upk"
+		.EVEN	; just in case
+PackedEnd:
+
+	.END
